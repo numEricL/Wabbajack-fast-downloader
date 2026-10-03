@@ -1,11 +1,10 @@
 import json
 import os
-import time
 import webbrowser
 import zipfile
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from typing import Optional, Generator, List
+from tkinter import filedialog, ttk
+from typing import List
 import sv_ttk
 import ctypes
 import sys
@@ -13,6 +12,8 @@ import sys
 import batch_download
 import extract_modlist
 from extract_modlist import write_urls_to_file
+
+LINK_OPEN_DELAY_MS = 500
 
 class ThemeManager:
     COLORS = {
@@ -93,13 +94,20 @@ class Application(tk.Tk):
     def __init__(self):
         super().__init__()
         self.output_file_path = 'output.txt'
+        self.generated_output_file_path = 'output.txt'
+        self.filtered_output_file_path = 'output-filtered.txt'
+        self.skipped_output_file_path = 'output-skipped.txt'
+        self.downloaded_output_file_path = 'output-downloaded.txt'
         self.links_amount = 0
         self.processed_links = tk.IntVar()
-        self.generator: Optional[Generator[List[str], None, None]] = None
+        self.max_size_mb = tk.StringVar(value=str(batch_download.DEFAULT_MAX_SIZE_MB))
+        self.batch_size = tk.StringVar(value=str(batch_download.DEFAULT_BATCH_SIZE))
+        self.links: List[str] = []
+        self.next_link_index = 0
+        self.is_downloading = False
         
         self.setup_window()
         self.create_widgets()
-        self.check_output_file()
 
     def setup_window(self) -> None:
         self.setup_windows_specific()
@@ -140,20 +148,31 @@ class Application(tk.Tk):
         self.create_console_section()
 
     def create_file_section(self):
-        # Create the section for mod list file selection
-        # Contains file path entry, browse and extract buttons
-        file_frame = ttk.LabelFrame(self.main_container, text="Mod List Selection", padding=5)
+        file_frame = ttk.LabelFrame(self.main_container, text="Source Files", padding=5)
         file_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         file_frame.grid_columnconfigure(0, weight=1)
 
+        ttk.Label(file_frame, text="Modlist:").grid(row=0, column=0, sticky="w", padx=(0, 5))
         self.file_path_entry = ttk.Entry(file_frame)
-        self.file_path_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.file_path_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
 
-        browse_btn = ttk.Button(file_frame, text="Browse", command=self.browse_file, width=8)
-        browse_btn.grid(row=0, column=1, padx=(0, 2))
+        browse_btn = ttk.Button(file_frame, text="Browse", command=self.browse_modlist, width=8)
+        browse_btn.grid(row=0, column=2)
 
-        extract_btn = ttk.Button(file_frame, text="Extract", command=self.extract_file, width=8)
-        extract_btn.grid(row=0, column=2)
+        ttk.Label(file_frame, text="URLs (optional):").grid(row=1, column=0, sticky="w", padx=(0, 5), pady=(5, 0))
+        self.output_path_entry = ttk.Entry(file_frame)
+        self.output_path_entry.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(5, 0))
+
+        browse_output_btn = ttk.Button(file_frame, text="Browse", command=self.browse_output, width=8)
+        browse_output_btn.grid(row=1, column=2, pady=(5, 0))
+
+        ttk.Label(file_frame, text="Maximum size (MB, 0 disables):").grid(
+            row=2, column=0, columnspan=2, sticky="e", padx=(0, 5), pady=(8, 0)
+        )
+        ttk.Entry(file_frame, textvariable=self.max_size_mb, width=8).grid(row=2, column=2, pady=(8, 0))
+
+        filter_btn = ttk.Button(file_frame, text="Build Filter", command=self.build_filtered_output, width=15)
+        filter_btn.grid(row=3, column=1, pady=(8, 0))
 
     def create_progress_section(self):
         # Create the download progress section
@@ -172,13 +191,18 @@ class Application(tk.Tk):
         )
         self.progress.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 10))
 
-        download_btn = ttk.Button(
+        batch_size_frame = ttk.Frame(progress_frame)
+        batch_size_frame.grid(row=1, column=0, pady=(0, 5))
+        ttk.Label(batch_size_frame, text="Batch size:").grid(row=0, column=0, padx=(0, 5))
+        ttk.Entry(batch_size_frame, textvariable=self.batch_size, width=8).grid(row=0, column=1)
+
+        self.download_btn = ttk.Button(
             progress_frame,
-            text="Download Batch",
+            text="Download Next Batch",
             command=self.download_links,
-            width=15
+            width=20
         )
-        download_btn.grid(row=1, column=0, pady=(5, 0))
+        self.download_btn.grid(row=2, column=0, pady=(5, 0))
 
     def create_console_section(self):
         # Create the console output section
@@ -199,26 +223,33 @@ class Application(tk.Tk):
         style.configure('text.Horizontal.TProgressbar',
                        text=f"{self.processed_links.get()}/{self.links_amount}")
 
-    def browse_file(self):
-        """
-        Opens a file dialog to select a Wabbajack mod list file, updates the
-        file path entry box with the selected file's path.
-        """
-        filename = filedialog.askopenfilename(filetypes=[("Wabbajack mod list file", "*.wabbajack")])
+    def browse_modlist(self):
+        """Open a file dialog to select a Wabbajack modlist archive or JSON file."""
+        filename = filedialog.askopenfilename(
+            filetypes=[("Wabbajack modlist", "*.wabbajack"), ("JSON files", "*.json"), ("All files", "*.*")]
+        )
         if filename:
             self.file_path_entry.delete(0, tk.END)
             self.file_path_entry.insert(tk.END, filename)
 
-    def import_links(self) -> None:
+    def browse_output(self):
+        """Open a file dialog to select the source URL list."""
+        filename = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if filename:
+            self.output_path_entry.delete(0, tk.END)
+            self.output_path_entry.insert(tk.END, filename)
+
+    def import_links(self, file_path) -> None:
         self.processed_links.set(0)
+        self.next_link_index = 0
         try:
-            self.console.print("Importing URLs from output.txt file...")
-            self.links_amount = batch_download.count_lines(self.output_file_path)
+            self.console.print(f"Importing URLs from {file_path}...")
+            self.links = list(batch_download.read_links(file_path))
+            self.links_amount = len(self.links)
             if self.links_amount == 0:
-                self.console.print("No URLs found in output.txt file.")
+                self.console.print(f"No URLs found in {file_path}.")
                 return
                 
-            self.generator = batch_download.read_links_in_batches(self.output_file_path, 20)
             self.progress['maximum'] = self.links_amount
             self.update_progress_bar()
             self.console.print(f"Imported {self.links_amount} URLs.")
@@ -229,88 +260,176 @@ class Application(tk.Tk):
 
     def download_links(self):
         """
-        Downloads the URLs from the generator.
-
-        This function retrieves a batch of URLs from the generator and downloads them
-        using the webbrowser module. The progress bar is updated accordingly, with a
-        small delay between each link to prevent browser issues.
+        Starts automatic batch downloading.
         """
-        if self.generator is None:
-            self.console.print("No URLs to download. Please import URLs from output.txt first.")
+        if self.is_downloading:
+            return
+        if not self.links:
+            self.console.print("No URLs to download. Build a filtered output file first.")
             return
         if self.links_amount == 0 or self.processed_links.get() == self.links_amount:
             self.console.print("No URLs to open.")
             return
+        self.is_downloading = True
+        self.download_btn.state(["disabled"])
+        self.open_current_batch()
+
+    def open_current_batch(self):
+        """Open one batch and wait for the user before opening another."""
+        if self.next_link_index >= len(self.links):
+            self.finish_downloading()
+            return
         batch_links = self.get_batch()
-        for link in batch_links:
-            webbrowser.open(link)  # Uncommented this line
-            time.sleep(0.5)  # Add small delay between links
-            self.processed_links.set(self.processed_links.get() + 1)
+        if batch_links is None:
+            self.finish_downloading()
+            return
+        self.open_next_link(iter(batch_links), [])
+
+    def open_next_link(self, links, opened_links):
+        """Open one link, then schedule the next link in the current batch."""
+        try:
+            link = next(links)
+        except StopIteration:
+            batch_download.append_new_links(self.downloaded_output_file_path, opened_links)
+            self.console.print(f"Opened {self.processed_links.get()} out of {self.links_amount} URLs.")
+            self.finish_downloading()
+            return
+
+        try:
+            opened = webbrowser.open(link)
+        except (OSError, webbrowser.Error) as error:
+            opened = False
+            self.console.print(f"Error opening {link}: {error}")
+
+        if opened:
+            opened_links.append(link)
+        else:
+            self.console.print(f"Error: Could not open {link}.")
+        self.processed_links.set(self.processed_links.get() + 1)
         self.update_progress_bar()
-        self.console.print(f"Opened {self.processed_links.get()} out of {self.links_amount} URLs.")
+        self.after(LINK_OPEN_DELAY_MS, self.open_next_link, links, opened_links)
+
+    def finish_downloading(self):
+        """Restore the download button after all queued URLs are processed."""
+        self.is_downloading = False
+        self.download_btn.state(["!disabled"])
+        self.update_progress_bar()
+        self.console.print(f"Finished the current batch. Opened {self.processed_links.get()} URLs.")
 
     def get_batch(self):
         """
-        Returns a batch of URLs from the generator.
+        Returns the next batch of URLs using the current batch-size setting.
         """
         try:
-            return next(self.generator)
-        except StopIteration:
-            return []
+            batch_size = int(self.batch_size.get())
+        except ValueError:
+            self.console.print("Error: Batch size must be a whole number.")
+            return None
+        if batch_size < 1:
+            self.console.print("Error: Batch size must be at least 1.")
+            return None
 
-    def extract_file(self):
-        """
-        Extracts the 'modlist' file from the selected Wabbajack zip file and processes its content.
+        batch = self.links[self.next_link_index:self.next_link_index + batch_size]
+        self.next_link_index += len(batch)
+        return batch
 
-        This function retrieves the file path from the entry box, opens the selected zip file,
-        and extracts the 'modlist' file. The extracted JSON content is then passed to the
-        'extract_url' function for further processing. If any exception occurs during this
-        process, an error message is printed to the console.
-        """
+    def load_modlist(self, filename):
+        """Load a modlist from either a Wabbajack archive or a JSON file."""
+        if zipfile.is_zipfile(filename):
+            with zipfile.ZipFile(filename, 'r') as zip_file:
+                with zip_file.open("modlist", 'r') as metadata:
+                    return json.loads(metadata.read().decode('utf-8').replace("'", '"'))
+        with open(filename, 'r') as file:
+            return json.load(file)
+
+    def configure_output_paths(self, modlist_path):
+        """Keep generated files next to the selected modlist."""
+        output_directory = os.path.dirname(os.path.abspath(modlist_path))
+        self.generated_output_file_path = os.path.join(output_directory, "output.txt")
+        self.filtered_output_file_path = os.path.join(output_directory, "output-filtered.txt")
+        self.skipped_output_file_path = os.path.join(output_directory, "output-skipped.txt")
+        self.downloaded_output_file_path = os.path.join(output_directory, "output-downloaded.txt")
+
+    def build_filtered_output(self):
+        """Build the filtered URL list from the selected source files."""
         try:
             filename = self.file_path_entry.get()
-            if filename != "":
-                with zipfile.ZipFile(filename, 'r') as zipObj:
-                    metadata_name = "modlist"
-                    with zipObj.open(metadata_name, 'r') as metadata:
-                        self.extract_url(json.loads(metadata.read().decode('utf-8').replace("'", '"')))
+            source_file_path = self.output_path_entry.get().strip()
+            if not filename:
+                self.console.print("Error: Select a modlist file.")
+                return
+            self.configure_output_paths(filename)
+            modlist_file = self.load_modlist(filename)
+            if source_file_path:
+                self.output_file_path = source_file_path
+                source_urls = list(batch_download.read_links(source_file_path))
+                if not source_urls:
+                    self.console.print(f"No URLs found in {source_file_path}.")
+                    return
+            else:
+                self.output_file_path = self.generated_output_file_path
+                source_urls = [
+                    url for entry in modlist_file.get("Archives", [])
+                    if (url := extract_modlist.generate_url(entry))
+                ]
+                write_urls_to_file(source_urls, self.output_file_path)
+                self.console.print(f"Generated {len(source_urls)} URLs in {self.output_file_path}.")
+            self.filter_urls(modlist_file, source_urls)
         except Exception as e:
-            self.console.print("Error when extracting a file: " + e.__str__())
+            self.console.print("Error when building the filtered output: " + e.__str__())
 
-    def extract_url(self, modlist_file):
+    def filter_urls(self, modlist_file, source_urls=None):
         """
-        Extracts the URLs from the given mod list file and writes them to a file.
-
-        This function takes a mod list file as input and generates URLs from it.
-        The generated URLs are then written to a file called 'output.txt',
-        overwriting any existing file. If the output file already exists, the
-        user is asked if they want to overwrite it.
+        Filters URLs from output.txt using the archive sizes in a modlist file.
 
         :param modlist_file: A JSON object representing the content of a Wabbajack
             mod list file.
         :type modlist_file: dict
         """
-        self.console.print("Generating URLs from JSON data...")
-        urls = [url for entry in modlist_file.get("Archives", []) if (url := extract_modlist.generate_url(entry))]
-        self.console.print(f"Generated {len(urls)} URLs.")
+        try:
+            max_size_mb = float(self.max_size_mb.get())
+        except ValueError:
+            self.console.print("Error: Maximum size must be a number.")
+            return
+        if max_size_mb < 0:
+            self.console.print("Error: Maximum size cannot be negative.")
+            return
 
-        # ask is output file exits
-        if os.path.exists(self.output_file_path):
-            answer = messagebox.askokcancel("Overwrite", "Do you want to overwrite the output file?")
-            if not answer:
-                self.console.print("Aborted by user.")
+        downloaded_urls = (
+            set(batch_download.read_links(self.downloaded_output_file_path))
+            if os.path.exists(self.downloaded_output_file_path)
+            else set()
+        )
+        if source_urls is None:
+            source_urls = batch_download.read_links(self.output_file_path)
+        source_urls = [url for url in dict.fromkeys(source_urls) if url not in downloaded_urls]
+        if not source_urls:
+            self.console.print("No unprocessed URLs found in the selected source file.")
+            return
+
+        archive_sizes = batch_download.archive_sizes_from_archives(modlist_file.get("Archives", []))
+        if max_size_mb == 0:
+            filtered_urls, skipped_urls = source_urls, []
+        else:
+            filtered_urls, skipped_urls = batch_download.filter_links_by_size(
+                source_urls, archive_sizes, max_size_mb
+            )
+            if filtered_urls is None:
+                self.console.print("Error: Could not match every source URL to its archive size.")
                 return
 
-        self.console.print(f"Writing URLs to {self.output_file_path}...")
-        write_urls_to_file(urls, self.output_file_path)
-        self.console.print("Successfully wrote URLs to file.")
-        self.import_links()
-
-    def check_output_file(self):
-        # Check for existing output.txt and import if found
-        if os.path.exists(self.output_file_path):
-            self.console.print(f"Found output.txt file.")
-            self.import_links()
+        write_urls_to_file(filtered_urls, self.filtered_output_file_path)
+        batch_download.remove_logged_links(
+            self.skipped_output_file_path, downloaded_urls | set(filtered_urls)
+        )
+        batch_download.append_new_links(self.skipped_output_file_path, skipped_urls)
+        self.console.print(
+            f"Wrote {len(filtered_urls)} eligible URLs to {self.filtered_output_file_path} and "
+            f"logged {len(skipped_urls)} oversized URLs to {self.skipped_output_file_path}."
+        )
+        self.output_path_entry.delete(0, tk.END)
+        self.output_path_entry.insert(0, self.filtered_output_file_path)
+        self.import_links(self.filtered_output_file_path)
 
 
 def main():

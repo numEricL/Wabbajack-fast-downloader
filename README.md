@@ -30,9 +30,9 @@ Still works, archived because I don't want to support it anymore.
 
 3. Select the '*.wabbajack' modlist file
 
-4. Click 'Extract'
+4. Select the Wabbajack modlist and optionally a source `output.txt` file, then click 'Build Filter'. If no URL file is selected, the GUI generates `output.txt` from the modlist.
 
-5. Click 'Batch Download' to download links in batches
+5. Set the maximum archive size in MB (use `0` to disable filtering) and batch size, then click 'Batch Download'. The GUI opens one batch per click. Eligible URLs are written to `output-filtered.txt`; URLs over the limit are kept in `output-skipped.txt`; opened URLs are recorded in `output-downloaded.txt`. These output files are created beside the selected modlist.
 
 ## Terminal Usage | CLI Usage
 
@@ -62,13 +62,29 @@ Still works, archived because I don't want to support it anymore.
 
 5. **Batch Download:**
 
-   Run the batch download script to start downloading mods in batches:
+   Run the batch download script to open mods in batches. By default, it skips
+   archives larger than 10 MB using the size stored in the extracted `modlist`
+   file and writes their URLs to `skipped-output.txt`:
 
    ```bash
    python batch_download.py
    ```
 
-   The script will open download links in batches. Let the downloads complete, and press Enter in the terminal for the next batch.
+   To use a different size limit, pass `--max-size-mb`; use `0` to disable
+   size filtering:
+
+   ```bash
+   python batch_download.py --max-size-mb 250
+   ```
+
+   The default batch size is 20 URLs. Override it for a run with
+   `--batch-size`, for example:
+
+   ```bash
+   python batch_download.py --batch-size 10
+   ```
+
+   The script will open eligible download links in batches. Let the downloads complete, and press Enter in the terminal for the next batch.
 
 ## Acknowledgments
 
